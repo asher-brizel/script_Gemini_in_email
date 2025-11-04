@@ -43,7 +43,8 @@ def get_unread_emails():
 
 
 def send_email(to_email, subject, body):
-    msg = MIMEText(body)
+    # שימוש בקידוד utf-8 כדי לתמוך בכל שפה
+    msg = MIMEText(body, _charset='utf-8')
     msg['From'] = EMAIL_ACCOUNT
     msg['To'] = to_email
     msg['Subject'] = subject
@@ -73,17 +74,25 @@ def query_gemini_api(prompt):
     response = requests.post(GEMINI_API_URL, json=payload, headers=headers)
     if response.status_code == 200:
         response_json = response.json()
-        # הדפסה לבדיקת מבנה התגובה (אפשר להסיר אחר כך)
+        # הדפסה לבדיקת מבנה התגובה (אפשר להסיר אחרי שמוודאים תקינות)
         print("Gemini API response:", json.dumps(response_json, ensure_ascii=False, indent=2))
         try:
             candidates = response_json.get('candidates', [])
             if candidates:
-                content = candidates[0].get('content', '')
-                if isinstance(content, str):
-                    return content
+                content = candidates[0].get('content', {})
+                # מבנה התוכן: מפתחות כמו 'parts' עם רשימת dict שכוללים טקסט
+                if isinstance(content, dict):
+                    parts = content.get('parts', [])
+                    if parts and isinstance(parts[0], dict):
+                        text = parts[0].get('text', '')
+                        # ניקוי רווחים מיותרים מסביב
+                        return text.strip()
+                    else:
+                        return str(content).strip()
+                elif isinstance(content, str):
+                    return content.strip()
                 else:
-                    # המרה למחרוזת במקרה שהתוכן הוא לא מחרוזת
-                    return str(content)
+                    return str(content).strip()
             else:
                 return 'No candidates in response from Gemini'
         except Exception as e:
