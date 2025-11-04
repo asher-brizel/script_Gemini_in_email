@@ -4,6 +4,7 @@ import smtplib
 from email.mime.text import MIMEText
 import requests
 import os
+import json
 
 IMAP_SERVER = 'imap.gmail.com'  # אם המייל שלך בגוגל, אם לא יש לשנות בהתאם
 SMTP_SERVER = 'smtp.gmail.com'
@@ -11,6 +12,7 @@ EMAIL_ACCOUNT = os.getenv('EMAIL_ACCOUNT')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')  # סיסמת אפליקציה
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'
+
 
 def get_unread_emails():
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
@@ -39,6 +41,7 @@ def get_unread_emails():
     mail.logout()
     return emails
 
+
 def send_email(to_email, subject, body):
     msg = MIMEText(body)
     msg['From'] = EMAIL_ACCOUNT
@@ -49,6 +52,7 @@ def send_email(to_email, subject, body):
     server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
     server.sendmail(EMAIL_ACCOUNT, to_email, msg.as_string())
     server.quit()
+
 
 def query_gemini_api(prompt):
     headers = {
@@ -69,18 +73,24 @@ def query_gemini_api(prompt):
     response = requests.post(GEMINI_API_URL, json=payload, headers=headers)
     if response.status_code == 200:
         response_json = response.json()
-        # נסה למצוא את התשובה במבנה JSON - ייתכן שתצטרך להתאים לפי מבנה ההחזרה המדויק
-        # כאן דוגמה איך לשלוף טקסט מהרשימה 'candidates'
+        # הדפסה לבדיקת מבנה התגובה (אפשר להסיר אחר כך)
+        print("Gemini API response:", json.dumps(response_json, ensure_ascii=False, indent=2))
         try:
             candidates = response_json.get('candidates', [])
             if candidates:
-                return candidates[0].get('content', 'No reply content found')
+                content = candidates[0].get('content', '')
+                if isinstance(content, str):
+                    return content
+                else:
+                    # המרה למחרוזת במקרה שהתוכן הוא לא מחרוזת
+                    return str(content)
             else:
                 return 'No candidates in response from Gemini'
         except Exception as e:
             return f'Error parsing Gemini response: {e}'
     else:
         return f'Error from Gemini API: {response.status_code} - {response.text}'
+
 
 def main():
     emails = get_unread_emails()
@@ -89,6 +99,7 @@ def main():
         response = query_gemini_api(mail['body'])
         send_email(mail['from'], f"Re: {mail['subject']}", response)
         print("Response sent.")
+
 
 if __name__ == '__main__':
     main()
