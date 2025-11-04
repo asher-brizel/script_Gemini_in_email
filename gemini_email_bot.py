@@ -10,7 +10,7 @@ SMTP_SERVER = 'smtp.gmail.com'
 EMAIL_ACCOUNT = os.getenv('EMAIL_ACCOUNT')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')  # סיסמת אפליקציה
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_API_URL = 'https://api.gemini.example.com/v1/chat'  # החלף לכתובת האמיתית
+GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'
 
 def get_unread_emails():
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
@@ -52,19 +52,35 @@ def send_email(to_email, subject, body):
 
 def query_gemini_api(prompt):
     headers = {
-        'Authorization': f'Bearer {GEMINI_API_KEY}',
         'Content-Type': 'application/json',
+        'X-goog-api-key': GEMINI_API_KEY,
     }
     payload = {
-        'prompt': prompt,
-        'max_tokens': 500,
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
     }
     response = requests.post(GEMINI_API_URL, json=payload, headers=headers)
     if response.status_code == 200:
         response_json = response.json()
-        return response_json.get('reply', 'No response from Gemini')
+        # נסה למצוא את התשובה במבנה JSON - ייתכן שתצטרך להתאים לפי מבנה ההחזרה המדויק
+        # כאן דוגמה איך לשלוף טקסט מהרשימה 'candidates'
+        try:
+            candidates = response_json.get('candidates', [])
+            if candidates:
+                return candidates[0].get('content', 'No reply content found')
+            else:
+                return 'No candidates in response from Gemini'
+        except Exception as e:
+            return f'Error parsing Gemini response: {e}'
     else:
-        return f'Error from Gemini API: {response.status_code}'
+        return f'Error from Gemini API: {response.status_code} - {response.text}'
 
 def main():
     emails = get_unread_emails()
