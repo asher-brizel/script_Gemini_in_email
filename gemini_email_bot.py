@@ -42,9 +42,28 @@ def get_unread_emails():
     return emails
 
 
-def send_email(to_email, subject, body):
-    # שימוש בקידוד utf-8 כדי לתמוך בכל שפה
-    msg = MIMEText(body, _charset='utf-8')
+def send_email(to_email, subject, body_text):
+    # טקסט משופר עם כדורים והדגשה ב-bold, מיושר לימין עם CSS ב-HTML
+    html_body = f"""
+    <html>
+      <body style="direction: rtl; text-align: right; font-family: Arial, sans-serif;">
+        <p>אני<br>
+        אני מודל שפה גדול, שאומן על ידי גוגל. אני יכול לעזור לך במגוון רחב של משימות, כמו:</p>
+        <ul>
+          <li><b>יצירת טקסט:</b> אני יכול לכתוב סיפורים, שירים, תסריטים, מיילים, מכתבים, ועוד.</li>
+          <li><b>תרגום שפות:</b> אני יכול לתרגם טקסט משפה אחת לשפה אחרת.</li>
+          <li><b>סיכום טקסט:</b> אני יכול לסכם טקסט ארוך באופן תמציתי.</li>
+          <li><b>מענה על שאלות:</b> אני יכול לענות על שאלות על נושאים שונים.</li>
+          <li><b>מתן מידע:</b> אני יכול לספק מידע על נושאים שונים.</li>
+          <li><b>יצירת רעיונות:</b> אני יכול לעזור לך ליצור רעיונות חדשים.</li>
+        </ul>
+        <p>אני עדיין לומד ומשתפר כל הזמן, אבל אני תמיד שמח לעזור!<br>
+        יש משהו ספציפי שאתה רוצה שאעשה?</p>
+      </body>
+    </html>
+    """
+
+    msg = MIMEText(html_body, _subtype='html', _charset='utf-8')
     msg['From'] = EMAIL_ACCOUNT
     msg['To'] = to_email
     msg['Subject'] = subject
