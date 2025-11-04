@@ -23,7 +23,7 @@ jobs:
 
       - name: Run Gemini Email Bot
         env:
-          EMAIL_ACCOUNT: ${{ gute.0556705393@gmail.com }}
-          EMAIL_PASSWORD: ${{ lwnm mscy mxsk ibfp }}
-          GEMINI_API_KEY: ${{ AIzaSyCLzjJJqp1vQMCxauSzTWgMU1AtIlhOgQ8 }}
+          EMAIL_ACCOUNT: ${{ secrets.EMAIL_ACCOUNT }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python gemini_email_bot.py
