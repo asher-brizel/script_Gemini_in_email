@@ -1,4 +1,3 @@
-python
 import imaplib
 import email
 import smtplib
