@@ -1,68 +1,62 @@
+import os
 import imaplib
 import email
 import smtplib
-from email.mime.text import MIMEText
 import requests
-import os
-import json
+from email.mime.text import MIMEText
 
-# ---------------- הגדרות ----------------
+# --- הגדרות קבועות ---
+IMAP_SERVER = "imap.gmail.com"
+SMTP_SERVER = "smtp.gmail.com"
 
-IMAP_SERVER = 'imap.gmail.com'  # אם המייל שלך בגוגל
-SMTP_SERVER = 'smtp.gmail.com'
-EMAIL_ACCOUNT = os.getenv('EMAIL_ACCOUNT')
-EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')  # סיסמת אפליקציה
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'
+EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-
-# ---------------- פונקציות עזר ----------------
-
+# --- פונקציה לקבלת מיילים חדשים ---
 def get_unread_emails():
-    """שולף מיילים שלא נקראו מתיבת הדואר הנכנס"""
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
         mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-        mail.select('inbox')
+        mail.select("inbox")
+        result, data = mail.search(None, '(UNSEEN)')
 
-        typ, data = mail.search(None, 'UNSEEN')
-        mail_ids = data[0].split()
+        unread_msg_nums = data[0].split()
+        messages = []
 
-        emails = []
-        for mail_id in mail_ids:
-            typ, msg_data = mail.fetch(mail_id, '(RFC822)')
-            for response_part in msg_data:
-                if isinstance(response_part, tuple):
-                    msg = email.message_from_bytes(response_part[1])
-                    subject = msg['subject']
-                    from_ = email.utils.parseaddr(msg['from'])[1]
-                    body = ""
+        for num in unread_msg_nums:
+            result, msg_data = mail.fetch(num, "(RFC822)")
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
 
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            if part.get_content_type() == 'text/plain':
-                                body = part.get_payload(decode=True).decode(errors='ignore')
-                                break
-                    else:
-                        body = msg.get_payload(decode=True).decode(errors='ignore')
+            sender = email.utils.parseaddr(msg["From"])[1]
+            subject = msg["Subject"] if msg["Subject"] else "(ללא נושא)"
+            body = ""
 
-                    emails.append({'from': from_, 'subject': subject, 'body': body, 'id': mail_id})
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        charset = part.get_content_charset() or "utf-8"
+                        body += part.get_payload(decode=True).decode(charset, errors="ignore")
+            else:
+                charset = msg.get_content_charset() or "utf-8"
+                body += msg.get_payload(decode=True).decode(charset, errors="ignore")
 
+            messages.append({"from": sender, "subject": subject, "body": body})
         mail.logout()
-        return emails
-
+        return messages
     except Exception as e:
         print(f"[!] Error fetching emails: {e}")
         return []
 
-
+# --- שליחת מייל תשובה עם תגובת Gemini בלבד ---
 def send_email(to_email, subject, body_text):
-    """שולח מייל HTML עם תגובת Gemini בלבד"""
     try:
+        formatted_text = body_text.replace('\n', '<br>')
         html_body = f"""
         <html>
           <body style="direction: rtl; text-align: right; font-family: Arial, sans-serif;">
-            {body_text.replace('\n', '<br>')}
+            {formatted_text}
           </body>
         </html>
         """
@@ -81,63 +75,39 @@ def send_email(to_email, subject, body_text):
     except Exception as e:
         print(f"[!] Error sending email to {to_email}: {e}")
 
-
-def query_gemini_api(prompt):
-    """שולח את גוף המייל ל-Gemini ומחזיר את התגובה"""
+# --- קבלת תגובה מג'מיני ---
+def get_gemini_reply(prompt):
     try:
-        headers = {
-            'Content-Type': 'application/json',
-            'X-goog-api-key': GEMINI_API_KEY,
-        }
-        payload = {
-            "contents": [
-                {"parts": [{"text": prompt}]}
-            ]
-        }
-
-        response = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=30)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        data = {"contents": [{"parts": [{"text": prompt}]}]}
+        response = requests.post(url, headers=headers, json=data)
 
         if response.status_code == 200:
-            response_json = response.json()
-            candidates = response_json.get('candidates', [])
-            if candidates:
-                content = candidates[0].get('content', {})
-                if isinstance(content, dict):
-                    parts = content.get('parts', [])
-                    if parts and isinstance(parts[0], dict):
-                        return parts[0].get('text', '').strip()
-                return str(content).strip()
-            return 'No candidates found in Gemini response.'
+            result = response.json()
+            return result["candidates"][0]["content"]["parts"][0]["text"]
         else:
-            return f'Error from Gemini API: {response.status_code} - {response.text}'
-
+            print(f"[!] Gemini API error: {response.text}")
+            return "אירעה שגיאה בעת יצירת התגובה."
     except Exception as e:
-        return f'Error querying Gemini API: {e}'
+        print(f"[!] Error contacting Gemini API: {e}")
+        return "שגיאה פנימית בתקשורת עם Gemini."
 
-
-# ---------------- תהליך ראשי ----------------
-
+# --- הפעלת הבוט ---
 def main():
-    print("🔍 Checking for new emails...")
+    print("Starting Gemini Email Bot...")
     emails = get_unread_emails()
-
     if not emails:
-        print("📭 No new emails. Exiting quickly.")
-        return  # יציאה מהירה כדי לא לבזבז זמן ריצה
+        print("No new emails.")
+        return
 
-    print(f"📬 Found {len(emails)} new email(s). Processing...\n")
+    for msg in emails:
+        print(f"[📩] New email from: {msg['from']}")
+        print(f"Subject: {msg['subject']}")
+        print(f"Body: {msg['body'][:100]}...")  # הצגת חלק מהתוכן בלוג
 
-    for mail in emails:
-        try:
-            print(f"➡️  From: {mail['from']} | Subject: {mail['subject']}")
-            response = query_gemini_api(mail['body'])
-            print("💬 Gemini response received.")
-            send_email(mail['from'], f"Re: {mail['subject']}", response)
-            print("✅ Response sent.\n")
+        reply = get_gemini_reply(msg["body"])
+        send_email(msg["from"], f"Re: {msg['subject']}", reply)
 
-        except Exception as e:
-            print(f"[!] Error processing email from {mail['from']}: {e}\n")
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
