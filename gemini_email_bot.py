@@ -6,7 +6,7 @@ import requests
 import os
 import json
 
-IMAP_SERVER = 'imap.gmail.com'  # אם המייל שלך בגוגל, אם לא יש לשנות בהתאם
+IMAP_SERVER = 'imap.gmail.com'  # אם המייל שלך בגוגל
 SMTP_SERVER = 'smtp.gmail.com'
 EMAIL_ACCOUNT = os.getenv('EMAIL_ACCOUNT')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')  # סיסמת אפליקציה
@@ -15,6 +15,7 @@ GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini
 
 
 def get_unread_emails():
+    """שולף מיילים שלא נקראו מתיבת הדואר הנכנס"""
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
     mail.select('inbox')
@@ -30,35 +31,27 @@ def get_unread_emails():
                 msg = email.message_from_bytes(response_part[1])
                 subject = msg['subject']
                 from_ = email.utils.parseaddr(msg['from'])[1]
+                body = ""
+
                 if msg.is_multipart():
                     for part in msg.walk():
                         if part.get_content_type() == 'text/plain':
-                            body = part.get_payload(decode=True).decode()
+                            body = part.get_payload(decode=True).decode(errors='ignore')
                             break
                 else:
-                    body = msg.get_payload(decode=True).decode()
+                    body = msg.get_payload(decode=True).decode(errors='ignore')
+
                 emails.append({'from': from_, 'subject': subject, 'body': body, 'id': mail_id})
     mail.logout()
     return emails
 
 
 def send_email(to_email, subject, body_text):
-    # טקסט משופר עם כדורים והדגשה ב-bold, מיושר לימין עם CSS ב-HTML
+    """שולח מייל HTML עם תגובת Gemini בלבד"""
     html_body = f"""
     <html>
       <body style="direction: rtl; text-align: right; font-family: Arial, sans-serif;">
-        <p>אני<br>
-        אני מודל שפה גדול, שאומן על ידי גוגל. אני יכול לעזור לך במגוון רחב של משימות, כמו:</p>
-        <ul>
-          <li><b>יצירת טקסט:</b> אני יכול לכתוב סיפורים, שירים, תסריטים, מיילים, מכתבים, ועוד.</li>
-          <li><b>תרגום שפות:</b> אני יכול לתרגם טקסט משפה אחת לשפה אחרת.</li>
-          <li><b>סיכום טקסט:</b> אני יכול לסכם טקסט ארוך באופן תמציתי.</li>
-          <li><b>מענה על שאלות:</b> אני יכול לענות על שאלות על נושאים שונים.</li>
-          <li><b>מתן מידע:</b> אני יכול לספק מידע על נושאים שונים.</li>
-          <li><b>יצירת רעיונות:</b> אני יכול לעזור לך ליצור רעיונות חדשים.</li>
-        </ul>
-        <p>אני עדיין לומד ומשתפר כל הזמן, אבל אני תמיד שמח לעזור!<br>
-        יש משהו ספציפי שאתה רוצה שאעשה?</p>
+        {body_text.replace('\n', '<br>')}
       </body>
     </html>
     """
@@ -68,13 +61,13 @@ def send_email(to_email, subject, body_text):
     msg['To'] = to_email
     msg['Subject'] = subject
 
-    server = smtplib.SMTP_SSL(SMTP_SERVER, 465)
-    server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-    server.sendmail(EMAIL_ACCOUNT, to_email, msg.as_string())
-    server.quit()
+    with smtplib.SMTP_SSL(SMTP_SERVER, 465) as server:
+        server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_ACCOUNT, to_email, msg.as_string())
 
 
 def query_gemini_api(prompt):
+    """שולח את גוף המייל ל-Gemini ומחזיר את התגובה"""
     headers = {
         'Content-Type': 'application/json',
         'X-goog-api-key': GEMINI_API_KEY,
@@ -83,37 +76,26 @@ def query_gemini_api(prompt):
         "contents": [
             {
                 "parts": [
-                    {
-                        "text": prompt
-                    }
+                    {"text": prompt}
                 ]
             }
         ]
     }
+
     response = requests.post(GEMINI_API_URL, json=payload, headers=headers)
+
     if response.status_code == 200:
-        response_json = response.json()
-        # הדפסה לבדיקת מבנה התגובה (אפשר להסיר אחרי שמוודאים תקינות)
-        print("Gemini API response:", json.dumps(response_json, ensure_ascii=False, indent=2))
         try:
+            response_json = response.json()
             candidates = response_json.get('candidates', [])
             if candidates:
                 content = candidates[0].get('content', {})
-                # מבנה התוכן: מפתחות כמו 'parts' עם רשימת dict שכוללים טקסט
                 if isinstance(content, dict):
                     parts = content.get('parts', [])
                     if parts and isinstance(parts[0], dict):
-                        text = parts[0].get('text', '')
-                        # ניקוי רווחים מיותרים מסביב
-                        return text.strip()
-                    else:
-                        return str(content).strip()
-                elif isinstance(content, str):
-                    return content.strip()
-                else:
-                    return str(content).strip()
-            else:
-                return 'No candidates in response from Gemini'
+                        return parts[0].get('text', '').strip()
+                return str(content).strip()
+            return 'No candidates found in Gemini response.'
         except Exception as e:
             return f'Error parsing Gemini response: {e}'
     else:
@@ -121,10 +103,12 @@ def query_gemini_api(prompt):
 
 
 def main():
+    """תהליך ראשי: קבלת מיילים, שליחת תגובה מג'מיני, ושליחת מייל חזרה"""
     emails = get_unread_emails()
     for mail in emails:
         print(f"Processing email from {mail['from']} with subject: {mail['subject']}")
         response = query_gemini_api(mail['body'])
+        print("Gemini response:", response)
         send_email(mail['from'], f"Re: {mail['subject']}", response)
         print("Response sent.")
 
