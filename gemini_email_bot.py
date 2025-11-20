@@ -3,6 +3,7 @@ import imaplib
 import email
 import smtplib
 import requests
+import markdown
 from email.mime.text import MIMEText
 
 # --- הגדרות קבועות ---
@@ -14,7 +15,7 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 
-# --- פונקציה לקבלת מיילים חדשים ---
+# --- קבלת מיילים חדשים ---
 def get_unread_emails():
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
@@ -53,11 +54,13 @@ def get_unread_emails():
         return []
 
 
-# --- שליחת מייל עם חתימה ---
+# --- שליחת מייל ---
 def send_email(to_email, subject, body_text):
     try:
-        formatted_text = body_text.replace("\n", "<br>")
+        # המרת Markdown ל־HTML (כולל Bold, קישורים וכו')
+        formatted_text = markdown.markdown(body_text)
 
+        # חתימה מותאמת
         signature = """
         <hr>
         <div style="color:#666; font-size:14px; margin-top:10px;">
@@ -89,7 +92,7 @@ def send_email(to_email, subject, body_text):
         print(f"[!] Error sending email: {e}")
 
 
-# --- קבלת תגובה מג'מיני ---
+# --- קריאה ל־Gemini ---
 def get_gemini_reply(prompt):
     try:
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
