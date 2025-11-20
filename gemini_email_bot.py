@@ -5,15 +5,54 @@ import smtplib
 import requests
 import markdown
 from email.mime.text import MIMEText
+import json
+import re
 
 # --- הגדרות קבועות ---
 IMAP_SERVER = "imap.gmail.com"
 SMTP_SERVER = "smtp.gmail.com"
+THREADS_FILE = "threads.json"
 
 EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# --- טעינה ושמירה של השרשורים מקובץ JSON ---
+def load_threads():
+    try:
+        with open(THREADS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[!] Error loading threads: {e}")
+        return {}
+
+def save_threads(threads):
+    try:
+        with open(THREADS_FILE, "w", encoding="utf-8") as f:
+            json.dump(threads, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[!] Error saving threads: {e}")
+
+# --- ניקוי חתימות והודעות חוזרות ---
+def clean_email_body(body):
+    # הסרת חתימות סטנדרטיות
+    patterns_to_remove = [
+        r"--\s*\n.*",               # קו חתימה --
+        r"Sent from my .*",          # טקסטים כמו Sent from my iPhone
+        r"שלח:.*",                   # שורות של מייל קודם בעברית
+        r"נשלח:.*",
+        r"From:.*",
+        r"To:.*",
+        r"Cc:.*",
+        r"Subject:.*",
+        r"-----Original Message-----",
+        r"^>+",                       # ציטוטים מקויים
+    ]
+    pattern = "|".join(patterns_to_remove)
+    body = re.split(pattern, body, flags=re.IGNORECASE | re.MULTILINE)[0]
+    return body.strip()
 
 # --- קבלת מיילים חדשים ---
 def get_unread_emails():
@@ -34,6 +73,7 @@ def get_unread_emails():
             sender = email.utils.parseaddr(msg["From"])[1]
             subject = msg["Subject"] if msg["Subject"] else "(ללא נושא)"
             message_id = msg["Message-ID"]
+            in_reply_to = msg.get("In-Reply-To")
             body = ""
 
             if msg.is_multipart():
@@ -45,11 +85,14 @@ def get_unread_emails():
                 charset = msg.get_content_charset() or "utf-8"
                 body += msg.get_payload(decode=True).decode(charset, errors="ignore")
 
+            body = clean_email_body(body)
+
             messages.append({
                 "from": sender,
                 "subject": subject,
                 "body": body,
-                "message_id": message_id
+                "message_id": message_id,
+                "in_reply_to": in_reply_to
             })
 
         mail.logout()
@@ -59,6 +102,28 @@ def get_unread_emails():
         print(f"[!] Error fetching emails: {e}")
         return []
 
+# --- בניית השרשור עבור ג'מיני ---
+def build_thread_for_gemini(message, threads):
+    thread_id = message["in_reply_to"] or message["message_id"]
+
+    if thread_id not in threads:
+        threads[thread_id] = []
+
+    # הוספת הודעת המשתמש החדשה
+    threads[thread_id].append({
+        "from": "user",
+        "body": message["body"]
+    })
+
+    # בניית טקסט לג'מיני
+    gemini_prompt = ""
+    for msg in threads[thread_id]:
+        if msg["from"] == "user":
+            gemini_prompt += f"[משתמש כתב]:\n{msg['body']}\n\n"
+        elif msg["from"] == "gemini":
+            gemini_prompt += f"[ג'מיני כתב]:\n{msg['body']}\n\n"
+
+    return gemini_prompt, thread_id
 
 # --- שליחת מייל כולל שרשור ---
 def send_email(to_email, subject, body_text, original_message_id=None):
@@ -86,7 +151,6 @@ def send_email(to_email, subject, body_text, original_message_id=None):
         msg["To"] = to_email
         msg["Subject"] = subject
 
-        # <<< תוספת קריטית לשרשור >>>
         if original_message_id:
             msg["In-Reply-To"] = original_message_id
             msg["References"] = original_message_id
@@ -99,7 +163,6 @@ def send_email(to_email, subject, body_text, original_message_id=None):
 
     except Exception as e:
         print(f"[!] Error sending email: {e}")
-
 
 # --- קבלת תגובה מג'מיני ---
 def get_gemini_reply(prompt):
@@ -130,28 +193,43 @@ def get_gemini_reply(prompt):
         print(f"[!] Error contacting Gemini API: {e}")
         return "שגיאה פנימית בתקשורת עם Gemini."
 
-
 # --- הפעלת הבוט ---
 def main():
     print("Starting Gemini Email Bot...")
 
+    threads = load_threads()
     emails = get_unread_emails()
+
     if not emails:
         print("No new emails.")
         return
 
     for msg in emails:
         print(f"[📩] New email from {msg['from']}")
-        reply = get_gemini_reply(msg["body"])
 
+        # --- בניית השרשור המסומן ---
+        gemini_prompt, thread_id = build_thread_for_gemini(msg, threads)
+
+        # --- שליחת השרשור לג'מיני לקבלת תשובה ---
+        gemini_reply = get_gemini_reply(gemini_prompt)
+
+        # --- שמירת תגובת ג'מיני בשרשור ---
+        threads[thread_id].append({
+            "from": "gemini",
+            "body": gemini_reply
+        })
+
+        # --- שליחת המייל למשתמש ---
         send_email(
             msg["from"],
             f"Re: {msg['subject']}",
-            reply,
-            msg["message_id"]   # <<< המשך שרשור מלא
+            gemini_reply,
+            msg["message_id"]
         )
 
+    # --- שמירה עדכנית של השרשורים ---
+    save_threads(threads)
 
 if __name__ == "__main__":
     main()
-    
+                      
