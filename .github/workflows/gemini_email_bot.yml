@@ -3,7 +3,7 @@ name: Gemini Email Bot
 on:
   schedule:
     - cron: '*/2 * * * *'  # ריצה כל 2 דקות
-  workflow_dispatch:       # אפשר להריץ גם ידנית
+  workflow_dispatch:       # אפשר להריץ ידנית
 
 jobs:
   run-bot:
@@ -22,6 +22,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests
+          pip install markdown    # ← התקנה קריטית!
 
       - name: Run Gemini Email Bot
         env:
@@ -32,3 +33,4 @@ jobs:
           echo "Starting Gemini Email Bot..."
           python gemini_email_bot.py
           echo "Bot finished successfully."
+          
