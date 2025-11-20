@@ -33,6 +33,7 @@ def get_unread_emails():
 
             sender = email.utils.parseaddr(msg["From"])[1]
             subject = msg["Subject"] if msg["Subject"] else "(ללא נושא)"
+            message_id = msg["Message-ID"]
             body = ""
 
             if msg.is_multipart():
@@ -44,7 +45,12 @@ def get_unread_emails():
                 charset = msg.get_content_charset() or "utf-8"
                 body += msg.get_payload(decode=True).decode(charset, errors="ignore")
 
-            messages.append({"from": sender, "subject": subject, "body": body})
+            messages.append({
+                "from": sender,
+                "subject": subject,
+                "body": body,
+                "message_id": message_id
+            })
 
         mail.logout()
         return messages
@@ -54,13 +60,11 @@ def get_unread_emails():
         return []
 
 
-# --- שליחת מייל ---
-def send_email(to_email, subject, body_text):
+# --- שליחת מייל כולל שרשור ---
+def send_email(to_email, subject, body_text, original_message_id=None):
     try:
-        # המרת Markdown ל־HTML (כולל Bold, קישורים וכו')
         formatted_text = markdown.markdown(body_text)
 
-        # חתימה מותאמת
         signature = """
         <hr>
         <div style="color:#666; font-size:14px; margin-top:10px;">
@@ -82,6 +86,11 @@ def send_email(to_email, subject, body_text):
         msg["To"] = to_email
         msg["Subject"] = subject
 
+        # <<< תוספת קריטית לשרשור >>>
+        if original_message_id:
+            msg["In-Reply-To"] = original_message_id
+            msg["References"] = original_message_id
+
         with smtplib.SMTP_SSL(SMTP_SERVER, 465) as server:
             server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
             server.sendmail(EMAIL_ACCOUNT, to_email, msg.as_string())
@@ -92,7 +101,7 @@ def send_email(to_email, subject, body_text):
         print(f"[!] Error sending email: {e}")
 
 
-# --- קריאה ל־Gemini ---
+# --- קבלת תגובה מג'מיני ---
 def get_gemini_reply(prompt):
     try:
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
@@ -134,9 +143,15 @@ def main():
     for msg in emails:
         print(f"[📩] New email from {msg['from']}")
         reply = get_gemini_reply(msg["body"])
-        send_email(msg["from"], f"Re: {msg['subject']}", reply)
+
+        send_email(
+            msg["from"],
+            f"Re: {msg['subject']}",
+            reply,
+            msg["message_id"]   # <<< המשך שרשור מלא
+        )
 
 
 if __name__ == "__main__":
     main()
-        
+    
