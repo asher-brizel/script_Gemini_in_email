@@ -19,8 +19,10 @@ EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# מודל: אפשר לשנות לפי מה שיש לך פעיל
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+# תן מודל "מועדף", אבל אם הוא לא זמין - נעשה fallback אוטומטי לפי models.list
+PREFERRED_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
 # ---------- עזר: פענוח כותרות מייל ----------
@@ -60,16 +62,16 @@ def save_threads(threads: Dict[str, Any]) -> None:
 # --- ניקוי חתימות והודעות חוזרות ---
 def clean_email_body(body: str) -> str:
     patterns_to_remove = [
-        r"--\s*\n.*",                 # קו חתימה --
-        r"Sent from my .*",           # Sent from my iPhone וכו'
-        r"שלח:.*",                    # שורות של מייל קודם בעברית
+        r"--\s*\n.*",
+        r"Sent from my .*",
+        r"שלח:.*",
         r"נשלח:.*",
         r"From:.*",
         r"To:.*",
         r"Cc:.*",
         r"Subject:.*",
         r"-----Original Message-----",
-        r"^>+.*$",                    # ציטוטים
+        r"^>+.*$",
     ]
     pattern = "|".join(patterns_to_remove)
     body = re.split(pattern, body, flags=re.IGNORECASE | re.MULTILINE)[0]
@@ -109,12 +111,10 @@ def extract_body(msg: email.message.Message) -> str:
             elif msg.get_content_type() == "text/html":
                 html_parts.append(decoded)
 
-    # עדיפות לטקסט רגיל
     body = "\n".join(text_parts).strip()
     if body:
         return body
 
-    # fallback ל-HTML (מינימלי: הסרת תגיות בסיסית)
     if html_parts:
         html = "\n".join(html_parts)
         html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
@@ -158,11 +158,9 @@ def get_unread_emails() -> List[Dict[str, Any]]:
             message_id = msg.get("Message-ID")
             in_reply_to = msg.get("In-Reply-To")
 
-            body = extract_body(msg)
-            body = clean_email_body(body)
+            body = clean_email_body(extract_body(msg))
 
             if not message_id:
-                # בלי message-id קשה לשרשר; נייצר אחד מקומי
                 message_id = f"<local-{num.decode('utf-8', 'ignore')}@bot>"
 
             messages.append({
@@ -188,13 +186,11 @@ def build_thread_for_gemini(message: Dict[str, Any], threads: Dict[str, Any]) ->
     if thread_id not in threads:
         threads[thread_id] = []
 
-    # הוספת הודעת המשתמש החדשה
     threads[thread_id].append({
         "from": "user",
         "body": message["body"]
     })
 
-    # בניית טקסט לג'מיני
     gemini_prompt = (
         "אתה עוזר במייל. כתוב תשובה מקצועית, קצרה וברורה בעברית.\n"
         "אם חסר מידע – שאל שאלה אחת-שתיים בלבד.\n\n"
@@ -209,7 +205,7 @@ def build_thread_for_gemini(message: Dict[str, Any], threads: Dict[str, Any]) ->
     return gemini_prompt, thread_id
 
 
-# --- שליחת מייל כולל שרשור ---
+# --- שליחת מייל ---
 def send_email(to_email: str, subject: str, body_text: str, original_message_id: Optional[str] = None) -> None:
     try:
         if not EMAIL_ACCOUNT or not EMAIL_PASSWORD:
@@ -253,15 +249,64 @@ def send_email(to_email: str, subject: str, body_text: str, original_message_id:
         print(f"[!] Error sending email: {e}")
 
 
-# --- קבלת תגובה מג'מיני (מתוקן: key ב-URL + פירוט שגיאות מלא) ---
-def get_gemini_reply(prompt: str) -> str:
+# --------- Gemini: models.list + בחירת מודל תומך generateContent ---------
+def gemini_list_models() -> List[Dict[str, Any]]:
+    if not GEMINI_API_KEY:
+        return []
+
+    url = f"{API_BASE}/models?key={GEMINI_API_KEY}"
+    try:
+        r = requests.get(url, timeout=30)
+        if r.status_code != 200:
+            print(f"[!] models.list failed ({r.status_code}): {r.text}")
+            return []
+        data = r.json()
+        return data.get("models", [])
+    except Exception as e:
+        print(f"[!] models.list exception: {e}")
+        return []
+
+
+def pick_generate_content_model(preferred: str) -> str:
+    """
+    מחזיר מודל שמופיע ב-models.list וגם תומך ב-generateContent.
+    אם המועדף זמין - משתמשים בו. אחרת: בוחרים ראשון שמתאים.
+    """
+    models = gemini_list_models()
+    if not models:
+        # אם models.list נכשל - נשאיר את המועדף (לפחות נקבל שגיאה מפורטת בהמשך)
+        return preferred
+
+    # נבנה מפה: model_id -> supports_generateContent
+    candidates = []
+    for m in models:
+        name = m.get("name", "")           # "models/gemini-...."
+        methods = m.get("supportedGenerationMethods", []) or []
+        if not name.startswith("models/"):
+            continue
+        model_id = name.split("/", 1)[1]
+        if "generateContent" in methods:
+            candidates.append(model_id)
+
+    if preferred in candidates:
+        return preferred
+
+    # fallback: קח ראשון (יציב) — פשוט הראשון ברשימה התואמת
+    if candidates:
+        print(f"[DBG] Preferred model '{preferred}' not available. Fallback -> '{candidates[0]}'")
+        return candidates[0]
+
+    # אין אף מודל עם generateContent? נדיר, אבל נחזיר מועדף.
+    return preferred
+
+
+# --- קבלת תגובה מג'מיני (מתוקן) ---
+def get_gemini_reply(prompt: str, model_id: str) -> str:
     if not GEMINI_API_KEY:
         return "שגיאה: GEMINI_API_KEY לא מוגדר (Secret חסר ב-GitHub Actions או משתנה סביבה חסר)."
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
+    # לפי הדוק: model חייב להיות models/* :contentReference[oaicite:2]{index=2}
+    url = f"{API_BASE}/models/{model_id}:generateContent?key={GEMINI_API_KEY}"
 
     data = {
         "contents": [
@@ -270,24 +315,25 @@ def get_gemini_reply(prompt: str) -> str:
     }
 
     try:
-        response = requests.post(url, json=data, timeout=60)
+        r = requests.post(url, json=data, timeout=60)
 
-        if response.status_code != 200:
-            # כאן תראה את השגיאה האמיתית מהשרת
-            return f"Gemini API error ({response.status_code}): {response.text}"
+        if r.status_code != 200:
+            return f"Gemini API error ({r.status_code}) model={model_id}: {r.text}"
 
-        result = response.json()
-
+        result = r.json()
         candidates = result.get("candidates", [])
         if not candidates:
-            return f"Gemini API: אין candidates. Raw: {result}"
+            return f"Gemini API: אין candidates. model={model_id}. Raw: {result}"
 
         content = candidates[0].get("content", {})
         parts = content.get("parts", [])
         if not parts or "text" not in parts[0]:
             finish_reason = candidates[0].get("finishReason")
             safety = candidates[0].get("safetyRatings")
-            return f"Gemini API: אין טקסט בתשובה (finishReason={finish_reason}). safetyRatings={safety}. Raw: {result}"
+            return (
+                f"Gemini API: אין טקסט בתשובה. model={model_id} "
+                f"(finishReason={finish_reason}) safetyRatings={safety}. Raw: {result}"
+            )
 
         return parts[0]["text"]
 
@@ -299,11 +345,14 @@ def get_gemini_reply(prompt: str) -> str:
 def main() -> None:
     print("Starting Gemini Email Bot...")
 
-    # בדיקות מהירות (בלי לחשוף סודות)
     print("[DBG] EMAIL_ACCOUNT exists:", bool(EMAIL_ACCOUNT))
     print("[DBG] EMAIL_PASSWORD exists:", bool(EMAIL_PASSWORD))
     print("[DBG] GEMINI_API_KEY exists:", bool(GEMINI_API_KEY), "len:", (len(GEMINI_API_KEY) if GEMINI_API_KEY else 0))
-    print("[DBG] GEMINI_MODEL:", GEMINI_MODEL)
+    print("[DBG] Preferred GEMINI_MODEL:", PREFERRED_GEMINI_MODEL)
+
+    # 👇 זה התיקון שמונע 404 בגלל שם מודל לא קיים:
+    active_model = pick_generate_content_model(PREFERRED_GEMINI_MODEL)
+    print("[DBG] Active GEMINI_MODEL:", active_model)
 
     threads = load_threads()
     emails = get_unread_emails()
@@ -315,13 +364,10 @@ def main() -> None:
     for msg in emails:
         print(f"[📩] New email from {msg['from']} | subject: {msg['subject']}")
 
-        gemini_prompt, thread_id = build_thread_for_gemini(msg, threads)
-        gemini_reply = get_gemini_reply(gemini_prompt)
+        prompt, thread_id = build_thread_for_gemini(msg, threads)
+        gemini_reply = get_gemini_reply(prompt, active_model)
 
-        threads[thread_id].append({
-            "from": "gemini",
-            "body": gemini_reply
-        })
+        threads[thread_id].append({"from": "gemini", "body": gemini_reply})
 
         send_email(
             msg["from"],
