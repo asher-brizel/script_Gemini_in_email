@@ -23,29 +23,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests markdown
 
-      - name: Debug env (safe)
-        run: |
-          python - << 'PY'
-          import os
-          k=os.getenv("GEMINI_API_KEY")
-          a=os.getenv("EMAIL_ACCOUNT")
-          p=os.getenv("EMAIL_PASSWORD")
-          print("EMAIL_ACCOUNT exists:", bool(a))
-          print("EMAIL_PASSWORD exists:", bool(p))
-          print("GEMINI_API_KEY exists:", bool(k), "len:", (len(k) if k else 0))
-          print("GEMINI_MODEL:", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
-          PY
-        env:
-          EMAIL_ACCOUNT: ${{ secrets.EMAIL_ACCOUNT }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
-
       - name: Run Gemini Email Bot
         env:
           EMAIL_ACCOUNT: ${{ secrets.EMAIL_ACCOUNT }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # אופציונלי: אם אתה רוצה להכריח מודל מסוים
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
         run: |
           echo "Starting Gemini Email Bot..."
