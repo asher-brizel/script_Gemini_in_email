@@ -2,8 +2,8 @@ name: Gemini Email Bot
 
 on:
   schedule:
-    - cron: '*/2 * * * *'  # ריצה כל 2 דקות
-  workflow_dispatch:       # אפשר להריץ ידנית
+    - cron: '*/2 * * * *'
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -21,16 +21,33 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
-          pip install markdown    # ← התקנה קריטית!
+          pip install requests markdown
+
+      - name: Debug env (safe)
+        run: |
+          python - << 'PY'
+          import os
+          k=os.getenv("GEMINI_API_KEY")
+          a=os.getenv("EMAIL_ACCOUNT")
+          p=os.getenv("EMAIL_PASSWORD")
+          print("EMAIL_ACCOUNT exists:", bool(a))
+          print("EMAIL_PASSWORD exists:", bool(p))
+          print("GEMINI_API_KEY exists:", bool(k), "len:", (len(k) if k else 0))
+          print("GEMINI_MODEL:", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
+          PY
+        env:
+          EMAIL_ACCOUNT: ${{ secrets.EMAIL_ACCOUNT }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
 
       - name: Run Gemini Email Bot
         env:
           EMAIL_ACCOUNT: ${{ secrets.EMAIL_ACCOUNT }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
         run: |
           echo "Starting Gemini Email Bot..."
           python gemini_email_bot.py
-          echo "Bot finished successfully."
-          
+          echo "Bot finished."
