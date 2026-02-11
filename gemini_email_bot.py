@@ -21,12 +21,17 @@ EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# "מועדף" בלבד. בפועל נבחר מודל קיים דרך models.list
 PREFERRED_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")  # אופציונלי
 
-# אם מוגדר, שולחים הודעות שגיאה רק אליך (מומלץ)
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")  # למשל: asher.0556705393@gmail.com
-
+# יעד אורך: מיילים ארוכים ומפורטים
+TARGET_STYLE = (
+    "ענה תשובה ארוכה מאוד, מפורטת, ומעשית. "
+    "תן פירוט, דוגמאות, צעדים, ורשימת אפשרויות. "
+    "אל תחסוך במילים. "
+    "אם המשתמש מבקש 'בדיחה' — תן 3 בדיחות שונות + אחת קצרה ואחת ארוכה. "
+    "אם יש כמה אפשרויות — הצג אותן עם יתרונות/חסרונות."
+)
 
 # ----------------- JSON threads -----------------
 def load_threads() -> Dict[str, Any]:
@@ -72,7 +77,7 @@ def clean_email_body(body: str) -> str:
         r"Subject:.*",
         r"-----Original Message-----",
         r"^>+.*$",
-        r"^On .*wrote:.*$",  # אנגלית
+        r"^On .*wrote:.*$",
     ]
     pattern = "|".join(patterns_to_remove)
     body = re.split(pattern, body, flags=re.IGNORECASE | re.MULTILINE)[0]
@@ -175,7 +180,7 @@ def get_unread_emails() -> List[Dict[str, Any]]:
         return []
 
 
-# ----------------- Thread prompt (זהות קשיחה + מניעת תשובות כלליות) -----------------
+# ----------------- Thread prompt (מפורט מאוד) -----------------
 def build_thread_for_gemini(message: Dict[str, Any], threads: Dict[str, Any]) -> Tuple[str, str]:
     thread_id = message["in_reply_to"] or message["message_id"]
 
@@ -184,22 +189,27 @@ def build_thread_for_gemini(message: Dict[str, Any], threads: Dict[str, Any]) ->
 
     threads[thread_id].append({"from": "user", "body": message["body"]})
 
+    # 🔥 זה מה שגורם לאריכות: חוקי כתיבה + פורמט קבוע
     system_instructions = (
         "אתה בוט אימייל אוטומטי.\n"
         "אתה הוא זה שכתב את התשובות הקודמות בשרשור זה.\n"
-        "ענה בעברית, קצר, ענייני, ולעניין.\n"
-        "אסור לכתוב תשובות פתיחה כלליות כמו: 'קיבלתי את פנייתך' / 'אשמח אם תפרט'.\n"
-        "אם חסר מידע — שאל מקסימום 1-2 שאלות ממוקדות, לפי ההקשר.\n"
-        "אם המשתמש כתב 'תן בדיחה' — תן בדיחה טובה.\n\n"
+        "אתה חייב לענות תשובות ארוכות מאוד ומפורטות.\n"
+        f"{TARGET_STYLE}\n\n"
+        "כל תשובה תיכתב בפורמט הזה בדיוק:\n"
+        "1) תקציר קצר (2-3 שורות)\n"
+        "2) תשובה מפורטת מאוד (לפחות 12-20 שורות)\n"
+        "3) דוגמאות/נוסחים/אפשרויות (לפחות 3 פריטים)\n"
+        "4) שאלות המשך (עד 3 שאלות, רק אם באמת חסר מידע)\n\n"
+        "אסור לכתוב תשובת פתיחה כללית כמו: 'קיבלתי את פנייתך'.\n\n"
         "=== היסטוריית השרשור ===\n"
     )
 
     history = ""
-    for msg in threads[thread_id][-12:]:  # מגביל אחרונות כדי לא לנפח
+    for msg in threads[thread_id][-12:]:
         who = "משתמש" if msg["from"] == "user" else "אתה"
         history += f"{who}:\n{msg['body']}\n\n"
 
-    prompt = system_instructions + history + "ענה עכשיו כהמשך ישיר:\n"
+    prompt = system_instructions + history + "ענה עכשיו כהמשך ישיר, לפי הפורמט:\n"
     return prompt, thread_id
 
 
@@ -251,7 +261,7 @@ def send_email(to_email: str, subject: str, body_text: str, original_message_id:
 def gemini_list_models() -> List[Dict[str, Any]]:
     if not GEMINI_API_KEY:
         return []
-    url = f"{API_BASE}/models?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
     try:
         r = requests.get(url, timeout=30)
         if r.status_code != 200:
@@ -265,11 +275,11 @@ def gemini_list_models() -> List[Dict[str, Any]]:
 def pick_generate_content_model(preferred: str) -> str:
     models = gemini_list_models()
     if not models:
-        return preferred  # אם list נכשל – ננסה לפחות, ונקבל שגיאה מפורטת
+        return preferred
 
     candidates = []
     for m in models:
-        name = m.get("name", "")  # "models/xxx"
+        name = m.get("name", "")
         methods = m.get("supportedGenerationMethods", []) or []
         if name.startswith("models/") and "generateContent" in methods:
             candidates.append(name.split("/", 1)[1])
@@ -283,15 +293,24 @@ def pick_generate_content_model(preferred: str) -> str:
 
 
 def call_gemini(prompt: str, model_id: str) -> Tuple[bool, str]:
-    """מחזיר (ok, text_or_error)"""
     if not GEMINI_API_KEY:
         return False, "Missing GEMINI_API_KEY"
 
     url = f"{API_BASE}/models/{model_id}:generateContent?key={GEMINI_API_KEY}"
-    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+
+    # 🔥 generationConfig כדי לדחוף אורך
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.8,
+            "topP": 0.95,
+            # ערך גבוה = מרחיב. אם תראה שזה נחתך עדיין, תעלה ל-4096/8192 (תלוי מודל)
+            "maxOutputTokens": 2048
+        }
+    }
 
     try:
-        r = requests.post(url, json=payload, timeout=60)
+        r = requests.post(url, json=payload, timeout=90)
         if r.status_code != 200:
             return False, f"Gemini API error ({r.status_code}) model={model_id}: {r.text}"
 
@@ -316,7 +335,6 @@ def call_gemini(prompt: str, model_id: str) -> Tuple[bool, str]:
 # ----------------- Main -----------------
 def main() -> None:
     print("Starting Gemini Email Bot...")
-
     print("[DBG] EMAIL_ACCOUNT exists:", bool(EMAIL_ACCOUNT))
     print("[DBG] EMAIL_PASSWORD exists:", bool(EMAIL_PASSWORD))
     print("[DBG] GEMINI_API_KEY exists:", bool(GEMINI_API_KEY), "len:", (len(GEMINI_API_KEY) if GEMINI_API_KEY else 0))
@@ -333,7 +351,7 @@ def main() -> None:
         return
 
     for msg in emails:
-        print(f"[📩] From: {msg['from']} | Subject: {msg['subject']} | Body: {msg['body'][:80]}...")
+        print(f"[📩] From: {msg['from']} | Subject: {msg['subject']}")
 
         prompt, thread_id = build_thread_for_gemini(msg, threads)
         ok, reply_or_error = call_gemini(prompt, active_model)
@@ -348,11 +366,13 @@ def main() -> None:
                 msg["message_id"]
             )
         else:
-            # ✅ לא שולחים שגיאות API ללקוח
             err = reply_or_error
             print("[!] Gemini failed:", err)
 
-            safe_reply = "יש תקלה זמנית במנוע התשובות. נסה שוב בעוד כמה דקות 🙂"
+            safe_reply = (
+                "יש תקלה זמנית במנוע התשובות ולכן לא הצלחתי לייצר תשובה מפורטת עכשיו.\n"
+                "נסה שוב בעוד כמה דקות 🙂"
+            )
             send_email(
                 msg["from"],
                 f"Re: {msg['subject']}",
@@ -360,7 +380,6 @@ def main() -> None:
                 msg["message_id"]
             )
 
-            # אופציונלי: שליחת דוח שגיאה רק אליך
             if ADMIN_EMAIL and ADMIN_EMAIL != msg["from"]:
                 send_email(
                     ADMIN_EMAIL,
