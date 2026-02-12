@@ -22,7 +22,7 @@ jobs:
 
       # ✅ Restore cache של state כדי למנוע כפילויות בין ריצות
       - name: Restore answered_ids cache
-      - uses: actions/cache@v4
+        uses: actions/cache@v4
         with:
           path: answered_ids.txt
           key: answered-ids-${{ github.run_id }}
