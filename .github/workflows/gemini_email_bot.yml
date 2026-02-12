@@ -2,7 +2,7 @@ name: Gemini Email Bot
 
 on:
   schedule:
-    - cron: '* * * * *'   # כל דקה (המקסימום)
+    - cron: '* * * * *'   # כל דקה
   workflow_dispatch:
 
 concurrency:
@@ -12,22 +12,12 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      # ✅ שומר מצב בין ריצות כדי שלא נענה פעמיים
-      - name: Cache state
-        uses: actions/cache@v4
-        with:
-          path: bot_state.json
-          key: gemini-email-bot-state-v1
-          restore-keys: |
-            gemini-email-bot-state-v1
 
       - name: Install dependencies
         run: |
@@ -40,9 +30,6 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
-
-          # כמה אחורה לחפש (בדקות)
-          LOOKBACK_MINUTES: "60"
-          # כמה מיילים מקסימום לראות בכל ריצה
+          LOOKBACK_MINUTES: "120"
           MAX_EMAILS_PER_RUN: "20"
         run: python gemini_email_bot.py
