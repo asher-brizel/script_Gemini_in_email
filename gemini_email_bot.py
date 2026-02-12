@@ -26,16 +26,19 @@ PREFERRED_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "180"))
 MAX_EMAILS_PER_RUN = int(os.getenv("MAX_EMAILS_PER_RUN", "30"))
 
-DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("DEFAULT_MAX_OUTPUT_TOKENS", "1200"))
+DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("DEFAULT_MAX_OUTPUT_TOKENS", "1400"))
 GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "4"))
 
-# Persistent state to prevent duplicates across runs (critical on GitHub Actions)
+# Persistent state to prevent duplicates across runs
 STATE_FILE = os.getenv("STATE_FILE", "answered_ids.txt")
 STATE_MAX_IDS = int(os.getenv("STATE_MAX_IDS", "5000"))
 
 # Continuation settings
-MAX_CONTINUATIONS = int(os.getenv("MAX_CONTINUATIONS", "2"))  # max 2 "continue" calls
-MIN_NORMAL_CHARS = int(os.getenv("MIN_NORMAL_CHARS", "180"))  # below this likely truncated
+MAX_CONTINUATIONS = int(os.getenv("MAX_CONTINUATIONS", "3"))  # up to 3 continue calls
+MIN_NORMAL_CHARS = int(os.getenv("MIN_NORMAL_CHARS", "220"))  # below this likely truncated
+
+# Prompt context limits
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "6000"))
 
 # -------- logging --------
 def log(msg: str) -> None:
@@ -51,19 +54,12 @@ def decode_mime_header(value: Optional[str]) -> str:
         for t, enc in parts
     ).strip()
 
-def clean_email_body(text: str) -> str:
-    # gentle cleanup, not aggressive
-    patterns = [
-        r"-----Original Message-----.*",
-        r"^>.*$",
-        r"^\s*On .*wrote:\s*$",
-        r"--\s*$",
-    ]
-    for p in patterns:
-        text = re.split(p, text, flags=re.IGNORECASE | re.MULTILINE)[0]
-    return text.strip()
-
 def extract_body_from_msg(msg: email.message.Message) -> str:
+    """
+    IMPORTANT: Do NOT aggressively strip quoted text.
+    We want thread context when user replies with "finish it" etc.
+    We still do light cleanup of HTML -> text when needed.
+    """
     body = ""
     html = ""
 
@@ -93,12 +89,15 @@ def extract_body_from_msg(msg: email.message.Message) -> str:
                 html = decoded
 
     if not body and html:
+        # very light html->text
         html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
         html = re.sub(r"</p\s*>", "\n", html, flags=re.IGNORECASE)
         html = re.sub(r"<[^>]+>", "", html)
         body = html
 
-    return clean_email_body(body)
+    # normalize whitespace only (no quote stripping!)
+    body = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return body
 
 # -------- state helpers --------
 def load_answered_ids() -> Set[str]:
@@ -130,29 +129,41 @@ def trim_state_file(max_ids: int) -> None:
     except Exception as e:
         log(f"State trim failed: {e}")
 
+# -------- word counting helpers --------
+def count_hebrew_words(text: str) -> int:
+    # simple whitespace tokenization; good enough for "בדיוק 100 מילים"
+    tokens = re.findall(r"\S+", (text or "").strip())
+    return len(tokens)
+
 # -------- prompt rules --------
-def extract_length_instruction(text: str) -> Tuple[Optional[str], bool, bool]:
+def extract_length_instruction(text: str) -> Tuple[Optional[str], Optional[int], bool]:
     """
-    returns: (instruction, exact_word_count, user_requested_short)
+    returns: (instruction, exact_word_count_number, user_requested_short)
     """
     m = re.search(r"(\d+)\s*מילים", text)
     if m:
-        return f"כתוב בדיוק {m.group(1)} מילים.", True, False
+        n = int(m.group(1))
+        return f"כתוב בדיוק {n} מילים.", n, False
 
-    # If the user says "קצר" we still want a complete short answer (not 7-12 words)
     if re.search(r"\bקצר\b", text):
-        return "כתוב תשובה קצרה אבל שלמה (לפחות 2–3 משפטים מלאים).", False, True
+        return "כתוב תשובה קצרה אבל שלמה (לפחות 2–3 משפטים מלאים).", None, True
 
     if re.search(r"\bארוך\b", text):
-        return "כתוב תשובה מפורטת יותר מהרגיל (אבל בלי חפירות).", False, False
+        return "כתוב תשובה מפורטת יותר מהרגיל (אבל בלי חפירות).", None, False
 
-    return None, False, False
+    return None, None, False
 
-def build_prompt(user_text: str) -> Tuple[str, int, bool]:
+def clip_text(t: str, max_chars: int) -> str:
+    t = (t or "").strip()
+    if len(t) <= max_chars:
+        return t
+    return t[-max_chars:]  # keep the most recent tail (usually contains the latest replies)
+
+def build_prompt(subject: str, user_text: str, thread_context: str) -> Tuple[str, int, Optional[int]]:
     """
-    returns: (prompt, max_tokens, exact_word_mode)
+    returns: (prompt, max_tokens, exact_words_number)
     """
-    rule, exact, requested_short = extract_length_instruction(user_text)
+    rule, exact_n, requested_short = extract_length_instruction(user_text)
 
     prompt = (
         "ענה בעברית מלאה וזורמת.\n"
@@ -168,20 +179,37 @@ def build_prompt(user_text: str) -> Tuple[str, int, bool]:
 
     if rule:
         prompt += rule + "\n"
-        if exact:
-            max_tokens = max(max_tokens, 1400)
+        if exact_n is not None:
+            max_tokens = max(max_tokens, 1800)
         elif requested_short:
-            max_tokens = min(max_tokens, 600)
+            max_tokens = min(max_tokens, 650)
 
-    prompt += "\nהבקשה:\n" + user_text.strip()
-    return prompt, max_tokens, exact
+    # Thread-aware: include subject + thread context + current message
+    subject = (subject or "").strip()
+    if not subject:
+        subject = "(ללא נושא)"
+
+    ctx = clip_text(thread_context, MAX_CONTEXT_CHARS)
+    ut = clip_text(user_text, MAX_CONTEXT_CHARS)
+
+    prompt += (
+        "\n---\n"
+        f"נושא המייל: {subject}\n\n"
+        "הקשר מהשרשור (הודעות קודמות, אם קיימות):\n"
+        f"{ctx if ctx else '(אין)'}\n\n"
+        "ההודעה האחרונה של המשתמש:\n"
+        f"{ut}\n"
+        "---\n"
+        "ענה עכשיו:"
+    )
+    return prompt, max_tokens, exact_n
 
 # -------- SMTP send --------
 def send_email(to: str, subject: str, body: str, reply_to: Optional[str] = None) -> None:
     html_content = markdown.markdown(body)
     html = f"""
     <html lang="he" dir="rtl">
-      <body style="direction: rtl; text-align: right; font-family: Arial, sans-serif;">
+      <body style="direction: rtl; text-align: right; font-family: Arial, sans-serif; white-space: normal;">
         {html_content}
       </body>
     </html>
@@ -228,110 +256,102 @@ def pick_model(preferred: str) -> str:
         return candidates[0]
     return preferred
 
-# -------- Gemini response parsing + continuation --------
-def extract_gemini_text(data: dict) -> str:
+# -------- Gemini parsing + continuation --------
+def extract_gemini_text_and_finish_reason(data: dict) -> Tuple[str, str]:
     """
-    Gemini may return multiple parts. We join all text parts.
+    Join all 'parts' and read finishReason if present.
     """
+    text = ""
+    finish = ""
     try:
-        parts = data["candidates"][0]["content"].get("parts", [])
-        texts = []
+        cand = data.get("candidates", [{}])[0]
+        finish = (cand.get("finishReason") or "").strip()
+        content = cand.get("content") or {}
+        parts = content.get("parts", []) or []
+        chunks = []
         for p in parts:
             t = p.get("text")
             if t:
-                texts.append(t)
-        return "\n".join(texts).strip()
+                chunks.append(t)
+        text = "\n".join(chunks).strip()
     except Exception:
-        return ""
+        pass
+    return text, finish
 
-def looks_truncated(text: str) -> bool:
-    """
-    Heuristics for a cut answer:
-    - too short
-    - ends with ellipsis/colon/comma/dash
-    - does not end with a closing punctuation mark
-    """
+def looks_truncated(text: str, finish_reason: str) -> bool:
     t = (text or "").strip()
+    if not t:
+        return True
+    if finish_reason.upper() == "MAX_TOKENS":
+        return True
     if len(t) < MIN_NORMAL_CHARS:
         return True
-    if t.endswith(("...", "…", ":", ",", "–", "-", "שלושה מהנדסים")):
+    if t.endswith(("...", "…", ":", ",", "–", "-", "שלושה מהנדסים", "אני")):
         return True
     if not re.search(r"[\.!\?״\"]\s*$", t):
         return True
     return False
 
-def build_continue_prompt(original_user_text: str, partial_answer: str) -> str:
+def build_continue_prompt(full_prompt_used: str, partial_answer: str) -> str:
+    # Continue based on the same full prompt (includes context), not just user message
     return (
-        "ענה בעברית מלאה וזורמת.\n"
-        "המשך בדיוק מהמקום שבו עצרת, בלי לחזור להתחלה.\n"
-        "אל תקטע משפטים. סיים תשובה בצורה טבעית.\n"
-        "אל תוסיף כותרות.\n\n"
-        "בקשת המשתמש:\n"
-        f"{original_user_text.strip()}\n\n"
-        "התשובה עד עכשיו:\n"
+        f"{full_prompt_used}\n\n"
+        "התחלת תשובתך (שכבר נשלחה חלקית/נעצרת):\n"
         f"{partial_answer.strip()}\n\n"
-        "המשך עכשיו:"
+        "המשך בדיוק מהמקום שבו עצרת, בלי לחזור להתחלה. סיים תשובה בצורה טבעית:"
     )
 
-def call_gemini(prompt: str, model_id: str, max_tokens: int, exact_word_mode: bool) -> Tuple[bool, str]:
+def build_exact_words_fix_prompt(full_prompt_used: str, answer: str, exact_n: int) -> str:
+    return (
+        f"{full_prompt_used}\n\n"
+        "יש חובה לציית לאורך.\n"
+        f"ערוך/שכתב את התשובה כך שתהיה בדיוק {exact_n} מילים.\n"
+        "אל תשנה את המשמעות.\n"
+        "אל תוסיף כותרות.\n"
+        "הנה התשובה לשכתוב:\n"
+        f"{answer.strip()}\n\n"
+        "החזר עכשיו את התשובה המתוקנת בלבד:"
+    )
+
+def call_gemini(full_prompt: str, model_id: str, max_tokens: int) -> Tuple[bool, str, str]:
+    """
+    returns: (ok, text, finish_reason)
+    """
     url = f"{API_BASE}/models/{model_id}:generateContent?key={GEMINI_API_KEY}"
 
-    def do_call(p: str, mt: int) -> Tuple[int, dict, str]:
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": p}]}],
-            "generationConfig": {
-                "temperature": 0.9,
-                "topP": 0.95,
-                "maxOutputTokens": mt,
-                "candidateCount": 1
-            },
-        }
-        r = requests.post(url, json=payload, timeout=60)
-        data = {}
-        text = ""
-        if r.status_code == 200:
-            data = r.json()
-            text = extract_gemini_text(data)
-        return r.status_code, data, text
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.9,
+            "topP": 0.95,
+            "maxOutputTokens": max_tokens,
+            "candidateCount": 1,
+        },
+    }
 
     last_err = ""
     for attempt in range(1, GEMINI_RETRIES + 1):
         try:
-            status, data, text = do_call(prompt, max_tokens)
+            r = requests.post(url, json=payload, timeout=60)
 
-            if status == 200:
-                full = (text or "").strip()
+            if r.status_code == 200:
+                data = r.json()
+                text, finish = extract_gemini_text_and_finish_reason(data)
+                return True, text, finish
 
-                # If user asked EXACT word count -> do not continue automatically.
-                if exact_word_mode:
-                    return True, full
+            if r.status_code == 404:
+                return False, f"שגיאת Gemini 404: המודל '{model_id}' לא נמצא/לא זמין.", ""
+            if r.status_code in (401, 403):
+                return False, f"שגיאת Gemini {r.status_code}: בעיית הרשאה/מפתח API.", ""
 
-                # Otherwise, if it looks truncated, ask for continuation a couple of times.
-                for _ in range(MAX_CONTINUATIONS):
-                    if not full:
-                        break
-                    if not looks_truncated(full):
-                        break
-                    cont_prompt = build_continue_prompt(prompt, full)
-                    status2, _, text2 = do_call(cont_prompt, min(900, max_tokens))
-                    if status2 != 200 or not (text2 or "").strip():
-                        break
-                    full = (full.rstrip() + "\n" + text2.strip()).strip()
-
-                return True, full
-
-            if status == 404:
-                return False, f"שגיאת Gemini 404: המודל '{model_id}' לא נמצא/לא זמין."
-            if status in (401, 403):
-                return False, f"שגיאת Gemini {status}: בעיית הרשאה/מפתח API."
-            if status in (429, 500, 502, 503, 504):
+            if r.status_code in (429, 500, 502, 503, 504):
                 sleep_s = min(16, 2 ** attempt)
-                last_err = f"שגיאת Gemini {status}: עומס/מגבלה זמנית. ניסיון נוסף בעוד {sleep_s} שניות."
+                last_err = f"שגיאת Gemini {r.status_code}: עומס/מגבלה זמנית. ניסיון נוסף בעוד {sleep_s} שניות."
                 log(last_err)
                 time.sleep(sleep_s)
                 continue
 
-            return False, f"שגיאת Gemini {status}: {json.dumps(data)[:400] if data else 'no body'}"
+            return False, f"שגיאת Gemini {r.status_code}: {r.text[:400]}", ""
 
         except Exception as e:
             sleep_s = min(16, 2 ** attempt)
@@ -339,7 +359,128 @@ def call_gemini(prompt: str, model_id: str, max_tokens: int, exact_word_mode: bo
             log(last_err)
             time.sleep(sleep_s)
 
-    return False, last_err or "Gemini נכשל ללא פירוט."
+    return False, last_err or "Gemini נכשל ללא פירוט.", ""
+
+def generate_with_auto_continue(full_prompt: str, model_id: str, max_tokens: int) -> Tuple[bool, str]:
+    """
+    1) call Gemini
+    2) if looks truncated -> continue a few times
+    """
+    ok, text, finish = call_gemini(full_prompt, model_id, max_tokens)
+    if not ok:
+        return False, text
+
+    full = (text or "").strip()
+    fr = finish
+
+    for _ in range(MAX_CONTINUATIONS):
+        if not looks_truncated(full, fr):
+            break
+        cont_prompt = build_continue_prompt(full_prompt, full)
+        ok2, text2, finish2 = call_gemini(cont_prompt, model_id, min(1200, max_tokens))
+        if not ok2:
+            break
+        add = (text2 or "").strip()
+        if not add:
+            break
+        full = (full.rstrip() + "\n" + add).strip()
+        fr = finish2 or ""
+
+    return True, full
+
+def enforce_exact_words_if_needed(
+    full_prompt: str,
+    model_id: str,
+    max_tokens: int,
+    answer: str,
+    exact_n: Optional[int]
+) -> Tuple[bool, str]:
+    """
+    If exact word count requested, we verify and fix once (or twice).
+    """
+    if exact_n is None:
+        return True, answer
+
+    ans = (answer or "").strip()
+    if not ans:
+        return True, ans
+
+    for _ in range(2):
+        wc = count_hebrew_words(ans)
+        if wc == exact_n:
+            return True, ans
+        fix_prompt = build_exact_words_fix_prompt(full_prompt, ans, exact_n)
+        ok, fixed = generate_with_auto_continue(fix_prompt, model_id, min(1600, max_tokens))
+        if not ok:
+            return True, ans  # fall back to previous answer, better than failing
+        ans = (fixed or "").strip()
+
+    return True, ans
+
+# -------- IMAP helpers: fetch message by Message-ID for thread context --------
+def imap_search_by_message_id(mail: imaplib.IMAP4_SSL, msgid: str) -> Optional[bytes]:
+    """
+    Search message by Message-ID header. Returns IMAP sequence num (bytes) if found.
+    """
+    if not msgid:
+        return None
+    msgid = msgid.strip()
+    # Ensure quotes safe
+    q = msgid.replace('"', "")
+    res, data = mail.search(None, f'(HEADER Message-ID "{q}")')
+    if res != "OK":
+        return None
+    ids = data[0].split()
+    if not ids:
+        return None
+    return ids[-1]
+
+def fetch_body_by_imap_num(mail: imaplib.IMAP4_SSL, num: bytes) -> str:
+    res, msg_data = mail.fetch(num, "(RFC822)")
+    if res != "OK":
+        return ""
+    msg = email.message_from_bytes(msg_data[0][1])
+    return extract_body_from_msg(msg)
+
+def build_thread_context(mail: imaplib.IMAP4_SSL, current_msg: email.message.Message) -> str:
+    """
+    Build context from In-Reply-To / References chain (best-effort).
+    We only fetch 1-2 previous messages to avoid heavy IMAP load.
+    """
+    parts: List[str] = []
+
+    in_reply_to = (current_msg.get("In-Reply-To") or "").strip()
+    refs = (current_msg.get("References") or "").strip()
+
+    candidates: List[str] = []
+    if in_reply_to:
+        candidates.append(in_reply_to)
+
+    # Sometimes References contains multiple ids; take the last one as nearest parent
+    if refs:
+        # split by whitespace, keep items that look like <...>
+        ref_ids = [x.strip() for x in refs.split() if x.strip().startswith("<") and x.strip().endswith(">")]
+        if ref_ids:
+            candidates.append(ref_ids[-1])
+
+    # de-dup keeping order
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            ordered.append(c)
+
+    # fetch up to 2 parents
+    for mid in ordered[:2]:
+        imap_num = imap_search_by_message_id(mail, mid)
+        if not imap_num:
+            continue
+        b = fetch_body_by_imap_num(mail, imap_num).strip()
+        if b:
+            parts.append(f"[הודעה קודמת בשרשור]\n{b}")
+
+    return "\n\n".join(parts).strip()
 
 # -------- IMAP fetch (strong dedupe) --------
 def get_recent_candidate_emails(
@@ -351,10 +492,9 @@ def get_recent_candidate_emails(
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
     since_day = cutoff.strftime("%d-%b-%Y")
 
-    # Gmail is not perfectly consistent, so we combine this with our own STATE_FILE
-    result, data = mail.search(None, f'(SINCE {since_day} UNANSWERED)')
-    if result != "OK":
-        raise RuntimeError(f"IMAP search failed: {result} {data}")
+    res, data = mail.search(None, f'(SINCE {since_day} UNANSWERED)')
+    if res != "OK":
+        raise RuntimeError(f"IMAP search failed: {res} {data}")
 
     ids = data[0].split()
     ids = ids[-max_count:]
@@ -363,8 +503,8 @@ def get_recent_candidate_emails(
     me = (EMAIL_ACCOUNT or "").lower().strip()
 
     for num in reversed(ids):
-        result, msg_data = mail.fetch(num, "(RFC822)")
-        if result != "OK":
+        res, msg_data = mail.fetch(num, "(RFC822)")
+        if res != "OK":
             continue
 
         msg = email.message_from_bytes(msg_data[0][1])
@@ -400,12 +540,16 @@ def get_recent_candidate_emails(
 
         body = extract_body_from_msg(msg)
 
+        # build minimal thread context from parents
+        thread_ctx = build_thread_context(mail, msg)
+
         out.append({
             "imap_num": num,
             "from": sender,
             "subject": subject,
             "body": body,
-            "message_id": message_id
+            "message_id": message_id,
+            "thread_ctx": thread_ctx,
         })
 
     return out
@@ -437,17 +581,19 @@ def main():
 
     for m in emails:
         user_text = (m["body"] or "").strip()
+        subject = m.get("subject") or "(ללא נושא)"
+        thread_ctx = (m.get("thread_ctx") or "").strip()
 
         if not user_text:
             reply = "קיבלתי הודעה ריקה. תכתוב בקשה קצרה וברורה."
-            send_email(m["from"], f"Re: {m['subject']}", reply, m["message_id"])
+            send_email(m["from"], f"Re: {subject}", reply, m["message_id"])
             save_answered_id(m["message_id"])
             mark_answered(mail, m["imap_num"])
             continue
 
-        prompt, max_tokens, exact_mode = build_prompt(user_text)
-        ok, out = call_gemini(prompt, model_id, max_tokens, exact_mode)
+        full_prompt, max_tokens, exact_n = build_prompt(subject, user_text, thread_ctx)
 
+        ok, out = generate_with_auto_continue(full_prompt, model_id, max_tokens)
         if not ok:
             reply = (
                 "כרגע יש תקלה זמנית במנוע התשובות של גוגל.\n\n"
@@ -455,14 +601,17 @@ def main():
                 "נסה שוב בעוד דקה."
             )
         else:
-            reply = (out or "").strip() or "לא הצלחתי לייצר תשובה הפעם. נסה לנסח מחדש במשפט אחד."
+            ok2, final_out = enforce_exact_words_if_needed(full_prompt, model_id, max_tokens, out, exact_n)
+            reply = (final_out or "").strip()
 
-        send_email(m["from"], f"Re: {m['subject']}", reply, m["message_id"])
+            if not reply:
+                reply = "לא הצלחתי לייצר תשובה הפעם. נסה לנסח מחדש במשפט אחד."
+
+        send_email(m["from"], f"Re: {subject}", reply, m["message_id"])
 
         # lock it so it never repeats
         save_answered_id(m["message_id"])
         mark_answered(mail, m["imap_num"])
-
         log(f"Replied+locked: {m['from']} | {m['message_id']}")
 
     mail.logout()
