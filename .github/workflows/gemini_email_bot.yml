@@ -39,13 +39,16 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
-          LOOKBACK_MINUTES: "180"
-          MAX_EMAILS_PER_RUN: "30"
-          DEFAULT_MAX_OUTPUT_TOKENS: "1400"
+          LOOKBACK_MINUTES: "240"
+          MAX_EMAILS_PER_RUN: "25"
+          DEFAULT_MAX_OUTPUT_TOKENS: "3000"
           STATE_FILE: "answered_ids.txt"
-          STATE_MAX_IDS: "5000"
-          MAX_CONTINUATIONS: "3"
-          MIN_NORMAL_CHARS: "220"
-          MAX_CONTEXT_CHARS: "6000"
+          STATE_MAX_IDS: "10000"
+          MAX_THREAD_MESSAGES: "20"
+          MAX_TRANSCRIPT_CHARS: "20000"
+          MAX_SINGLE_MSG_CHARS: "3500"
+          MAX_EXACT_FIX_ATTEMPTS: "4"
+          MIN_NONEXACT_WORDS: "60"
+          MAX_REWRITE_ATTEMPTS: "2"
         run: |
           python gemini_email_bot.py
