@@ -2,7 +2,7 @@ name: Gemini Email Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # בפועל GitHub יריץ "בערך", וזה בסדר
+    - cron: '* * * * *'   # כל דקה (המקסימום ש-GitHub מאפשר)
   workflow_dispatch:
 
 jobs:
