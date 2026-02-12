@@ -5,6 +5,10 @@ on:
     - cron: '* * * * *'   # כל דקה (המקסימום ש-GitHub מאפשר)
   workflow_dispatch:
 
+concurrency:
+  group: gemini-email-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
