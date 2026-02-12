@@ -25,17 +25,16 @@ STATE_FILE = "bot_state.json"
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "60"))
 MAX_EMAILS_PER_RUN = int(os.getenv("MAX_EMAILS_PER_RUN", "20"))
 
-FALLBACK_REPLY = "משהו השתבש אצלי רגע 🤖😅 נסה שוב עוד דקה."
-
+# תשובות קצרות ולא חופרות
 DEFAULT_MAX_OUTPUT_TOKENS = 512
-GEMINI_RETRIES = 3
-RETRY_SLEEP = 2
 
+# ניסיונות + backoff (מוריד נפילות 429/5xx)
+GEMINI_RETRIES = 4
 
 def log(msg: str) -> None:
     print(f"[BOT] {msg}", flush=True)
 
-
+# -------------------- state --------------------
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -45,7 +44,6 @@ def load_state():
     except Exception:
         return {"replied_message_ids": []}
 
-
 def save_state(state):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -53,7 +51,7 @@ def save_state(state):
     except Exception as e:
         log(f"Failed saving state: {e}")
 
-
+# -------------------- email parsing --------------------
 def decode_mime_header(value):
     if not value:
         return ""
@@ -62,7 +60,6 @@ def decode_mime_header(value):
         t.decode(enc or "utf-8", errors="ignore") if isinstance(t, bytes) else t
         for t, enc in parts
     ).strip()
-
 
 def clean_email_body(text: str) -> str:
     patterns = [
@@ -75,7 +72,6 @@ def clean_email_body(text: str) -> str:
         text = re.split(p, text, flags=re.IGNORECASE | re.MULTILINE)[0]
     return text.strip()
 
-
 def extract_length_instruction(text: str):
     m = re.search(r"(\d+)\s*מילים", text)
     if m:
@@ -86,7 +82,6 @@ def extract_length_instruction(text: str):
         return "כתוב תשובה מפורטת יותר מהרגיל (אבל בלי חפירות).", False
     return None, False
 
-
 def build_prompt(user_text: str):
     rule, exact = extract_length_instruction(user_text)
 
@@ -94,6 +89,7 @@ def build_prompt(user_text: str):
         "ענה בעברית, בטון טבעי ולא רשמי.\n"
         "ענה רק למה שהתבקש.\n"
         "בלי תקצירים, בלי סעיפים קבועים, בלי הרצאות.\n"
+        "אם יש בקשת אורך מפורשת (למשל '100 מילים') חובה לציית.\n"
     )
 
     max_tokens = DEFAULT_MAX_OUTPUT_TOKENS
@@ -104,50 +100,6 @@ def build_prompt(user_text: str):
 
     prompt += "\nהבקשה:\n" + user_text.strip()
     return prompt, max_tokens
-
-
-def send_email(to, subject, body, reply_to=None):
-    html = markdown.markdown(body)
-    msg = MIMEText(html, "html", "utf-8")
-    msg["From"] = EMAIL_ACCOUNT
-    msg["To"] = to
-    msg["Subject"] = subject
-    if reply_to:
-        msg["In-Reply-To"] = reply_to
-        msg["References"] = reply_to
-
-    with smtplib.SMTP_SSL(SMTP_SERVER, 465) as s:
-        s.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-        s.sendmail(EMAIL_ACCOUNT, to, msg.as_string())
-
-
-def call_gemini(prompt: str, max_tokens: int):
-    url = f"{API_BASE}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.9, "maxOutputTokens": max_tokens},
-    }
-
-    last_err = ""
-    for i in range(GEMINI_RETRIES):
-        try:
-            r = requests.post(url, json=payload, timeout=60)
-            if r.status_code == 200:
-                data = r.json()
-                return True, data["candidates"][0]["content"]["parts"][0]["text"]
-            last_err = f"HTTP {r.status_code}: {r.text[:800]}"
-            # retry רק על זמני
-            if r.status_code in (429, 500, 502, 503, 504):
-                log(f"Gemini retry {i+1}/{GEMINI_RETRIES}: {r.status_code}")
-                time.sleep(RETRY_SLEEP * (i + 1))
-                continue
-            return False, last_err
-        except Exception as e:
-            last_err = f"Exception: {e}"
-            log(f"Gemini exception retry {i+1}/{GEMINI_RETRIES}: {e}")
-            time.sleep(RETRY_SLEEP * (i + 1))
-    return False, last_err or "Unknown Gemini error"
-
 
 def extract_body_from_msg(msg: email.message.Message) -> str:
     body = ""
@@ -185,33 +137,22 @@ def extract_body_from_msg(msg: email.message.Message) -> str:
 
     return clean_email_body(body)
 
-
+# -------------------- IMAP recent emails --------------------
 def get_recent_emails_in_inbox(lookback_minutes: int, max_count: int):
-    """
-    ✅ לא מסתמך על UNSEEN.
-    מחפש לפי תאריך SINCE (יום) ואז מסנן לפי Date header לטווח דקות.
-    """
-    if not EMAIL_ACCOUNT or not EMAIL_PASSWORD:
-        raise RuntimeError("Missing EMAIL_ACCOUNT/EMAIL_PASSWORD env vars")
-
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    since_day = cutoff.strftime("%d-%b-%Y")
 
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-
-    # חשוב: Gmail מצפה ל-INBOX
     mail.select("INBOX")
 
-    # IMAP SINCE עובד ברזולוציית יום, לכן נוסיף סינון לפי שעה אחר כך
-    since_day = cutoff.strftime("%d-%b-%Y")
     result, data = mail.search(None, f'(SINCE {since_day})')
     if result != "OK":
         mail.logout()
         raise RuntimeError(f"IMAP search failed: {result} {data}")
 
     ids = data[0].split()
-    # נתחיל מהאחרונים
-    ids = ids[-max_count:]
+    ids = ids[-max_count:]  # רק האחרונים
 
     messages = []
     for num in reversed(ids):
@@ -222,14 +163,12 @@ def get_recent_emails_in_inbox(lookback_minutes: int, max_count: int):
         msg = email.message_from_bytes(msg_data[0][1])
 
         # סינון לפי Date אמיתי
-        date_hdr = msg.get("Date")
         try:
-            dt = email.utils.parsedate_to_datetime(date_hdr)
+            dt = email.utils.parsedate_to_datetime(msg.get("Date"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             dt_utc = dt.astimezone(timezone.utc)
         except Exception:
-            # אם אי אפשר לפענח תאריך—ניקח אותו בכל זאת
             dt_utc = datetime.now(timezone.utc)
 
         if dt_utc < cutoff:
@@ -250,7 +189,95 @@ def get_recent_emails_in_inbox(lookback_minutes: int, max_count: int):
     mail.logout()
     return messages
 
+# -------------------- SMTP send (עברית ודאית) --------------------
+def send_email(to, subject, body, reply_to=None):
+    html_content = markdown.markdown(body)
 
+    html = f"""
+    <html lang="he" dir="rtl">
+      <body style="direction: rtl; text-align: right; font-family: Arial, sans-serif;">
+        {html_content}
+      </body>
+    </html>
+    """
+
+    msg = MIMEText(html, "html", "utf-8")
+    msg["From"] = EMAIL_ACCOUNT
+    msg["To"] = to
+    msg["Subject"] = subject
+    if reply_to:
+        msg["In-Reply-To"] = reply_to
+        msg["References"] = reply_to
+
+    with smtplib.SMTP_SSL(SMTP_SERVER, 465) as s:
+        s.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+        s.sendmail(EMAIL_ACCOUNT, to, msg.as_string())
+
+# -------------------- Gemini call + better fallback --------------------
+def call_gemini(prompt: str, max_tokens: int):
+    url = f"{API_BASE}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.9, "topP": 0.95, "maxOutputTokens": max_tokens},
+    }
+
+    last_err = ""
+    for attempt in range(1, GEMINI_RETRIES + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=60)
+            if r.status_code == 200:
+                data = r.json()
+                return True, data["candidates"][0]["content"]["parts"][0]["text"]
+
+            last_err = f"HTTP {r.status_code}"
+            # backoff אמיתי
+            if r.status_code in (429, 500, 502, 503, 504):
+                sleep_s = min(12, 2 ** attempt)
+                log(f"Gemini temporary error {r.status_code}; retry in {sleep_s}s")
+                time.sleep(sleep_s)
+                continue
+
+            # שגיאה לא זמנית
+            log(f"Gemini permanent error: {r.status_code} {r.text[:500]}")
+            return False, f"{last_err}: {r.text[:500]}"
+
+        except Exception as e:
+            last_err = f"Exception: {e}"
+            sleep_s = min(12, 2 ** attempt)
+            log(f"Gemini exception; retry in {sleep_s}s: {e}")
+            time.sleep(sleep_s)
+
+    return False, last_err or "Unknown Gemini error"
+
+def smart_fallback(user_text: str, err: str) -> str:
+    """
+    fallback שימושי וקצר:
+    - מנסה בכל זאת לענות משהו מינימלי לפי סוג הבקשה
+    - בלי אימוג'ים (כדי שלא יזוהה כאנגלית)
+    """
+    t = (user_text or "").strip()
+
+    # בקשת בדיחה + אורך
+    m = re.search(r"(\d+)\s*מילים", t)
+    if "בדיחה" in t and m:
+        n = int(m.group(1))
+        # לא "בדיוק" מושלם תמיד, אבל יהיה בערך ויעמוד ברוח
+        return (
+            f"ביקשת בדיחה בערך {n} מילים. היתה תקלה זמנית במנוע התשובות, אז הנה אחת קצרה במקום:\n\n"
+            "אדם נכנס למכולת ושואל: יש לכם לחם טרי? המוכר אומר: כן, יצא עכשיו מהתנור. "
+            "האדם מחייך ואומר: יופי, תגיד לו שיבוא אליי גם מחר, כי אני תמיד שוכח לקנות בזמן."
+        )
+
+    if "בדיחה" in t:
+        return (
+            "הייתה תקלה זמנית במנוע התשובות, אבל הנה בדיחה קצרה:\n\n"
+            "למה המחשב הלך לרופא? כי היה לו וירוס."
+        )
+
+    # ברירת מחדל: תשובה קצרה + בקשה לחזרה
+    return "הייתה תקלה זמנית במנוע התשובות. נסה שוב בעוד דקה."
+
+# -------------------- main --------------------
 def main():
     log("Run start")
 
@@ -266,12 +293,14 @@ def main():
         if mid in replied:
             continue
 
-        if not m["body"]:
-            reply = "קיבלתי הודעה ריקה 😅 תכתוב לי משפט אחד מה אתה צריך."
+        user_text = m["body"]
+
+        if not user_text:
+            reply = "קיבלתי הודעה ריקה. תכתוב לי בקשה קצרה וברורה."
         else:
-            prompt, max_tokens = build_prompt(m["body"])
+            prompt, max_tokens = build_prompt(user_text)
             ok, out = call_gemini(prompt, max_tokens)
-            reply = out.strip() if ok and out else FALLBACK_REPLY
+            reply = out.strip() if ok and out else smart_fallback(user_text, out if isinstance(out, str) else "")
 
         try:
             send_email(m["from"], f"Re: {m['subject']}", reply, mid)
@@ -281,12 +310,10 @@ def main():
         except Exception as e:
             log(f"SMTP failed: {e}")
 
-    # שמירה (מגבילים גודל כדי שלא יתנפח לנצח)
     state["replied_message_ids"] = list(replied)[-5000:]
     save_state(state)
 
     log(f"Run end. Sent replies: {sent_count}")
-
 
 if __name__ == "__main__":
     main()
