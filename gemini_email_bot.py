@@ -22,7 +22,7 @@ API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PREFERRED_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+PREFERRED_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "240"))
 MAX_EMAILS_PER_RUN = int(os.getenv("MAX_EMAILS_PER_RUN", "25"))
